@@ -35,6 +35,7 @@ FADO's predictive model is the fair soft oblique decision forest of
 | `src/configs/sweeps/` | The sweep configuration behind every reported run, and `launch.sh` |
 | `data/adult/` | The Adult dataset (UCI) |
 | `files/experiments/wandb_arm_metrics/` | Per-seed metrics of every reported run (one CSV per sweep) |
+| `DOCS/paper_icde/paper.pdf` | The paper |
 | `DOCS/paper_icde/scripts/` | Scripts that generate the paper's tables and numbers |
 | `DOCS/paper_icde/tables/` | The generated tables, as included in the paper |
 | `DOCS/paper_icde/supplementary/` | Full significance report, per-scenario detection split, ablation, dual-step, and intersectional reports, and the derivation of every number quoted in the text |
