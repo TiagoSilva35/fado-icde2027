@@ -1,0 +1,34 @@
+# Main results on Folktables (Table III): natural drift, train on 2015, stream 2017 then 2018
+# (10% subsample per seed). Also runs fado_no_lambda, FADO with the fixed weight lambda_base,
+# for the ablation of the adaptive constraint.
+#
+# 30 runs (30 reporting seeds).
+program: src/main.py
+project: fado-ablations
+method: grid
+name: all-arms-folktables
+metric:
+  name: delta_dp
+  goal: maximize
+parameters:
+  pipeline_model:
+    value: 'fado,fado_no_lambda,aranyani,arf,rfr'
+  pipeline_dataset:
+    value: folktables
+  folktables_subsample_fraction:
+    value: 0.1   # ~18.7k train + ~18.7k stream (full CA is 187k + 187k)
+  seeds:
+    values: ['66', '77', '88', '99', '101', '111', '122', '133', '144', '155', '166', '177', '188', '199', '202', '213', '224', '235', '246', '257', '268', '279', '291', '303', '314', '325', '336', '347', '358', '369']
+  deterministic:
+    value: true
+  wandb_log:
+    value: true
+  wandb_project:
+    value: fado-ablations
+command:
+  - ${env}
+  - PYTHONHASHSEED=0
+  - ${interpreter}
+  - -m
+  - src.main
+  - ${args}

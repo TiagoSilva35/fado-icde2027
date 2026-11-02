@@ -1,0 +1,22 @@
+\begin{table*}[t]
+\centering
+\caption{Detection of the Injected Drift by \fado{} on \adult{}, 30 Seeds per Scenario}
+\label{tab:detection}
+\setlength{\tabcolsep}{5pt}
+\footnotesize
+\begin{tabular}{@{}l cc cc cc cc@{}}
+\toprule
+& \multicolumn{2}{c}{Either detector} & \multicolumn{2}{c}{Accuracy detector} & \multicolumn{2}{c}{Fairness monitor} & \multicolumn{2}{c}{False alarms per run} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(l){8-9}
+Scenario & Detected & Delay & Detected & Delay & Detected & Delay & Accuracy & Fairness \\
+\midrule
+x\_permutations & 13/30 (43\%) & $505$ & 11/30 (37\%) & $426$ & 2/30 (7\%) & $943$ & $0.17$ & $0.83$ \\
+y\_swaps & 16/30 (53\%) & $116$ & 16/30 (53\%) & $116$ & 3/30 (10\%) & $675$ & $0.13$ & $1.83$ \\
+y\_prior\_skip & 27/30 (90\%) & $535$ & 10/30 (33\%) & $781$ & 17/30 (57\%) & $390$ & $0.47$ & $1.43$ \\
+x\_exceed\_skip & 2/30 (7\%) & $866$ & 0/30 (0\%) & -- & 2/30 (7\%) & $866$ & $0.17$ & $0.40$ \\
+\midrule
+All & 58/120 (48\%) & $424$ & 37/120 (31\%) & $388$ & 24/120 (20\%) & $511$ & $0.23$ & $1.12$ \\
+\bottomrule
+\end{tabular}
+\tnote{Detected: an alarm within $1{,}000$ samples after the onset. Delay: mean number of samples from the onset to that alarm, over the detected runs.}
+\end{table*}

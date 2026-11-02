@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Downloaded data and caches
+data/acs-folktables/
+files/pretrain_cache/
+files/experiments/stream_groups/
+
+# Per-run outputs (large; the per-seed metrics are in files/experiments/wandb_arm_metrics/)
+files/experiments/wandb/
+files/experiments/dataset_*/
+wandb/
+**/artifacts/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*~

@@ -1,0 +1,580 @@
+"""Driver code."""
+
+
+import os
+import copy
+import random
+import src.helpers.data as data
+import src.models.forest.forest as forest
+import src.models.forest.aranyani as aranyani
+import numpy as np
+import tensorflow as tf
+from src.helpers import utils
+import src.models.forest.clip_forest as clip_forest
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from absl import flags
+
+
+from src.helpers.plots import plot_metrics_over_timesteps
+
+from src.drift.create_drifted_ds import generate_drifted_dataset
+
+flags.DEFINE_string('sweep_id', '-1', 'Wandb sweep ID.')
+flags.DEFINE_float('lambda_const', 0.1, 'Cell to run.')
+flags.DEFINE_string('dataset', 'civil', 'Dataset name.')
+flags.DEFINE_integer('max_iter', 1, 'Total number of iterations.')
+flags.DEFINE_integer('depth', 4, 'Tree depth.')
+flags.DEFINE_integer('num_trees', 3, 'Number of trees.')
+flags.DEFINE_bool(
+    'compute_fairness', True, 'Whether to apply fairness constraints.'
+)
+flags.DEFINE_integer('batch_size', 1, 'Samples in an online batch.')
+flags.DEFINE_string('activation', 'sigmoid', 'Activation function.')
+flags.DEFINE_string('compute_mode', 'default', 'log or default.')
+flags.DEFINE_string('base_gamma', None, 'gamma for the gradients.')
+flags.DEFINE_string('constraint_type', 'node', '[node, leaf]')
+flags.DEFINE_string('gradient_type', 'vanilla', '[vanilla, momentum, ema]')
+flags.DEFINE_string('encoder_model', 'instructor', '[bert, instructor]')
+flags.DEFINE_string('offline_loss_type', 'mmd', '[mmd, l2, l1]')
+flags.DEFINE_bool('use_correlation_penalty', False, 
+                  'Whether to use dynamic correlation-based penalties.')
+flags.DEFINE_float('correlation_threshold', 0.3,
+                   'Threshold for marking features as correlated.')
+flags.DEFINE_float('penalty_aggression', 2.0,
+                   'How aggressively to penalize correlated features.')
+flags.DEFINE_bool('use_class_weights', False,
+                  'Whether to apply inverse-frequency class weights to the loss.')
+flags.DEFINE_bool('drift', False, 'Whether to apply drift to the dataset.')
+flags.DEFINE_bool('run_all_scenarios', False,
+                  'Run Aranyani on every drift scenario, collect results, and plot comparisons.')
+flags.DEFINE_string('drift_scenario', None,
+                    'Specific drift scenario name (e.g. abrupt_gender). Overrides --drift.')
+flags.DEFINE_bool('save_model', False, 'Whether to save the trained model.')
+flags.DEFINE_bool('load_model', False, 'Whether to load an existing model instead of training.')
+flags.DEFINE_string('model_path', None,
+                    'Path to save/load the model. If not specified, will use models/{dataset}_model.')
+flags.DEFINE_bool('prequential', False,
+                  'Use test-then-train (prequential) evaluation with drift reaction '
+                  'instead of inference-only evaluation.')
+flags.DEFINE_string('folktables_sensitive_attribute', 'sex',
+                    'Sensitive attribute for folktables: sex or race.')
+flags.DEFINE_string('folktables_states', 'CA',
+                    'Comma-separated state codes for folktables (e.g., CA or CA,TX).')
+flags.DEFINE_integer('folktables_train_year', 2015,
+                     'Training survey year for folktables.')
+flags.DEFINE_string('folktables_test_years', '2016,2017,2018',
+                    'Comma-separated test survey years for folktables.')
+flags.DEFINE_string('folktables_horizon', '1-Year',
+                    'ACS horizon for folktables (e.g., 1-Year).')
+flags.DEFINE_integer('seed', 42,
+                     'Random seed for model initialization and stochastic components.')
+flags.DEFINE_bool('run_seed_pipeline', False,
+                  'Run the same train/eval pipeline across multiple seeds and aggregate metrics.')
+flags.DEFINE_string('seeds', '',
+                    'Comma-separated seed list for --run_seed_pipeline (e.g., "11,22,33").')
+flags.DEFINE_float(
+    'drift_adwin_delta_warn',
+    0.02,
+    'ADWIN warning detector delta (higher = more sensitive). MUST be larger '
+    'than --drift_adwin_delta_confirm, otherwise the warning stage trips after '
+    'confirmation and the pre-warm phase never runs.',
+)
+flags.DEFINE_float(
+    'drift_adwin_delta_confirm',
+    0.00001,
+    'ADWIN confirm detector delta (higher = more sensitive). MUST be smaller '
+    'than --drift_adwin_delta_warn.',
+)
+flags.DEFINE_integer(
+    'detection_tolerance',
+    0,
+    'Acceptable delay (samples) for a detection to count as a true positive '
+    'for a change point, i.e. the acceptable window is [cp, cp + tolerance]. '
+    '0 means "one accuracy window", since a detector cannot see a change '
+    'before its own window has refilled.',
+)
+flags.DEFINE_float(
+    'drift_adwin_delta_warn_multiplier',
+    0.0,
+    'If > 0, derive the warning delta as confirm_delta * multiplier instead of '
+    'using --drift_adwin_delta_warn directly. A sweep cannot express the '
+    'constraint "warn must be more sensitive than confirm" (i.e. a larger '
+    'delta), so sweeps vary the confirm delta and this multiplier (> 1).',
+)
+flags.DEFINE_string(
+    'accuracy_detector',
+    'river:adwin',
+    'Drift detector for the accuracy/error stream, as "backend:name" '
+    '(river:adwin, capymoa:seed, capymoa:stepd, ...). '
+    'See src/models/forest/detectors.py for the full list.',
+)
+flags.DEFINE_string(
+    'fairness_detector',
+    'river:adwin',
+    'Drift detector for the fairness signal, as "backend:name".',
+)
+flags.DEFINE_string(
+    'fairness_signal_mode',
+    'per_sample',
+    'What the fairness detector consumes: per_sample (i.i.d. surrogate, '
+    'default), subsampled_dp, or raw_dp (the autocorrelated negative control). '
+    'See src/models/forest/fairness_signal.py.',
+)
+flags.DEFINE_float(
+    'fairness_target',
+    0.05,
+    'Lambda controller (2.1): the DP target epsilon, on the pipeline DP scale '
+    '(max deviation from the mean group positive rate; for two groups half the '
+    'rate gap). Lambda rises while DP is above it.',
+)
+flags.DEFINE_float(
+    'lambda_dual_lr',
+    0.01,
+    'Lambda controller (2.1): dual ascent step size eta. Lambda drains back to '
+    '--lambda_const at eta * (epsilon - DP) per sample once DP is below target.',
+)
+flags.DEFINE_float(
+    'lambda_max',
+    10.0,
+    'Lambda controller (2.1): upper bound on lambda.',
+)
+flags.DEFINE_bool(
+    'deterministic',
+    True,
+    'Pin TensorFlow op determinism (tf.config.experimental.enable_op_determinism). '
+    'Costs some speed; required for byte-identical reruns.',
+)
+flags.DEFINE_string(
+    'controller_components',
+    '',
+    'Ad-hoc reaction-controller ablation, e.g. "react_lr,prewarm" or '
+    '"fado_full,-react_temperature". Empty means the full controller. Applies '
+    'to --pipeline_model=aranyani; the fado_* model names carry their own '
+    'preset. See src/models/forest/controller.py.',
+)
+flags.DEFINE_integer(
+    'drift_accuracy_window',
+    0,
+    'Rolling window for the reported prequential accuracy. 0 means "use '
+    '--drift_fairness_window", so accuracy and DP/EO share one time scale.',
+)
+flags.DEFINE_float(
+    'drift_lr_prewarm_mult',
+    5.0,
+    'Learning-rate multiplier during warning prewarm.',
+)
+flags.DEFINE_float(
+    'drift_lr_spike_mult',
+    10.0,
+    'Learning-rate multiplier after confirmed drift.',
+)
+flags.DEFINE_integer(
+    'drift_lr_decay_steps',
+    3000,
+    'Steps used to decay learning rate back to base after drift response.',
+)
+flags.DEFINE_integer(
+    'drift_fairness_window',
+    1000,
+    'Rolling window used for fairness metrics in prequential evaluation.',
+)
+flags.DEFINE_integer(
+    'drift_cooldown',
+    200,
+    'Cooldown (samples) between drift detector triggers.',
+)
+flags.DEFINE_integer(
+    'drift_min_samples_per_stream',
+    30,
+    'Minimum stream samples before drift confirmation is allowed.',
+)
+flags.DEFINE_float(
+    'drift_temperature_on_drift',
+    0.1,
+    'Tree routing temperature assigned immediately after drift confirmation.',
+)
+flags.DEFINE_float(
+    'drift_temperature_recovery_target',
+    1.0,
+    'Target tree routing temperature after recovery.',
+)
+flags.DEFINE_float(
+    'drift_temperature_recovery_step',
+    0.002,
+    'Per-sample temperature increment while recovering from drift.',
+)
+
+
+FLAGS = flags.FLAGS
+
+
+def _set_global_seed(seed, deterministic=None):
+  """Seed every RNG the pipeline touches, and optionally pin TF op determinism.
+
+  Previously this covered ``random``, ``numpy`` and ``tensorflow`` only, so the
+  RFR arm (torch) was not reproducible at all. ``PYTHONHASHSEED`` has to be set
+  before the interpreter starts, so it is only reported here, not set.
+  """
+  seed = int(seed)
+  random.seed(seed)
+  np.random.seed(seed)
+  tf.random.set_seed(seed)
+  os.environ['TF_DETERMINISTIC_OPS'] = '1'
+  try:
+    import torch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+      torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+  except Exception:
+    pass  # torch is only needed by the RFR arm
+
+  if deterministic is None:
+    deterministic = bool(getattr(FLAGS, 'deterministic', True))
+  if deterministic:
+    try:
+      tf.config.experimental.enable_op_determinism()
+    except Exception as exc:
+      print(f"[SEED] op determinism unavailable on this build: {exc}")
+
+  if os.environ.get('PYTHONHASHSEED') is None:
+    print("[SEED] PYTHONHASHSEED is unset; export PYTHONHASHSEED=0 before "
+          "launching for byte-identical runs.")
+
+def _build_forest_model(dataset, data_dim, num_class, depth, num_trees, activation,
+                        compute_mode):
+  if dataset in ['celeba']:
+    return clip_forest.FairCLIPDecisionForest(
+        num_trees=num_trees,
+        data_dim=data_dim,
+        tree_depth=depth,
+        num_classes=num_class,
+        activation=activation,
+        compute_mode=compute_mode,
+    )
+  return forest.FairDecisionForest(
+      num_trees=num_trees,
+      data_dim=data_dim,
+      tree_depth=depth,
+      num_classes=num_class,
+      activation=activation,
+      compute_mode=compute_mode,
+  )
+
+
+def train(
+    dataset='civil',
+    lambda_const=1,
+    max_iter=1,
+    depth=4,
+    num_trees=3,
+    compute_fairness=True,
+    batch_size=1,
+    activation='sigmoid',
+    compute_mode='default',
+    base_gamma=None,
+    constraint_type='node',
+    gradient_type='vanilla',
+    encoder_model='instructor',
+    offline_loss_type='mmd',
+    local_run=False,
+    drift=False,
+    drift_scenario=None,
+    save_model=False,
+    load_model=False,
+    model_path=None,
+    prequential=False,
+    folktables_sensitive_attribute='sex',
+    folktables_states='CA',
+    folktables_train_year=2015,
+    folktables_test_years='2016,2017,2018',
+    folktables_horizon='1-Year',
+    seed=42,
+):
+  effective_seed = None if seed is None else int(seed)
+  if effective_seed is not None:
+    _set_global_seed(effective_seed)
+    print(f"Using random seed: {effective_seed}")
+
+  all_dps = []
+  all_accuracies = []
+  all_equalized_odds = []
+  effective_base_gamma = float(base_gamma) if base_gamma is not None else 0.9
+
+  data_dim, num_class = None, None
+  x_test, y_test, a_test, number_of_attributes = None, None, None, None  # For test set evaluation
+  folktables_states_list = [
+      state.strip() for state in str(folktables_states).split(',') if state.strip()
+  ] or ['CA']
+  folktables_test_years_tuple = tuple(
+      int(year.strip()) for year in str(folktables_test_years).split(',') if year.strip()
+  )
+  
+  # Check if we should load an existing model
+  if load_model:
+    if model_path is None:
+      model_path = f'src/models/{dataset}_model'
+    
+    model_file = f'{model_path}.pkl'
+    if os.path.exists(model_file):
+      print(f"Loading existing model from {model_file}...")
+      # Determine if it's a CLIP model
+      is_clip = dataset in ['celeba']
+      try:
+        if is_clip:
+          loaded_model = clip_forest.FairCLIPDecisionForest.load(model_path)
+        else:
+          loaded_model = forest.FairDecisionForest.load(model_path)
+      except (KeyError, TypeError, ValueError) as exc:
+        print(
+            f"Warning: Could not load {model_file} as an Aranyani forest checkpoint "
+            f"({exc}). Proceeding with training instead."
+        )
+        loaded_model = None
+      except AttributeError as exc:
+        print(
+            f"Warning: Incompatible checkpoint format in {model_file} ({exc}). "
+            "Proceeding with training instead."
+        )
+        loaded_model = None
+
+      if loaded_model is None:
+        print(
+            "Hint: this file may be a different model type (e.g., sklearn Pipeline). "
+            "Save an Aranyani model with --save_model to enable --load_model."
+        )
+      else:
+        if dataset == 'adult':
+          num_class = 2
+          x_train, x_test, y_train, y_test, a_train, a_test = data.read_adult(
+              drift, drift_scenario=drift_scenario
+          )
+          data_dim = x_train.shape[1]
+          assert len(set(a_train)) == 2, "Expected binary sensitive attribute for adult dataset"
+          print(f"Sensitive attribute values in training set: {set(a_train)}")
+        elif dataset == 'census':
+          num_class = 2
+          x_train, x_test, y_train, y_test, a_train, a_test = data.read_census()
+          data_dim = x_train.shape[1]
+        elif dataset == 'compas':
+          x_train, y_train, a_train = data.read_compas()
+          num_class = 2
+          data_dim = x_train.shape[1]
+        elif dataset == 'jigsaw':
+          x_train, y_train, a_train = data.read_jigsaw()
+          num_class = 2
+          data_dim = x_train.shape[1]
+        elif dataset == 'celeba':
+          x_train, y_train, a_train = data.read_celeba()
+          num_class = 2
+          data_dim = x_train.shape[1]
+        elif dataset == 'folktables':
+          x_train, x_test, y_train, y_test, a_train, a_test, _ = data.read_folktables(
+              train_year=folktables_train_year,
+              test_years=folktables_test_years_tuple,
+              state=folktables_states_list,
+              horizon=folktables_horizon,
+              sensitive_attribute=folktables_sensitive_attribute,
+          )
+          data_dim = x_train.shape[1]
+          num_class = 2
+        
+        # Evaluate the loaded model
+        if x_test is not None and len(x_test) > 0:
+          test_metrics = None
+          if not prequential:
+            test_metrics = utils.get_test_performance(
+                loaded_model, x_test, y_test, a_test,
+                data_dim=data_dim,
+                show_confusion_matrix=True,
+            )
+            print(f"\n{'='*80}")
+            print("Loaded Model Test Results:")
+            print(f"  Test Accuracy: {test_metrics['accuracy']:.4f}")
+            print(f"  Test DP: {test_metrics['dp']:.4f}")
+            print(f"  Test EO: {test_metrics['eo']:.4f}")
+            print(f"  Test AUC: {test_metrics['auc']:.4f}")
+            print(f"  Test F1-Score: {test_metrics['f1']:.4f}")
+            print(f"{'='*80}\n")
+          if prequential:
+              print("\nRunning prequential (test-then-train) evaluation...")
+              # Reload a fresh copy so baseline and prequential start from
+              # the same weights and we can compare fairly.
+              if is_clip:
+                preq_model = clip_forest.FairCLIPDecisionForest.load(model_path)
+              else:
+                preq_model = forest.FairDecisionForest.load(model_path)
+              preq_results = utils.evaluate_over_timesteps(
+                  preq_model, x_test, y_test, a_test, data_dim=data_dim,
+                  test_then_train=True,
+                  compute_fairness=compute_fairness,
+                  fairness_type='dp',
+                  lambda_const=lambda_const,
+                  tree_depth=depth,
+                  num_trees=num_trees,
+                  constraint_type=constraint_type,
+                  gradient_type=gradient_type,
+                  base_gamma=effective_base_gamma,
+                  static_params=None,
+              )
+              plot_metrics_over_timesteps(preq_results,
+                                          save_path='files/metrics_prequential.png')
+              final_acc = float(preq_results['accuracy'][-1]) if preq_results['accuracy'] else 0.0
+              final_dp = float(preq_results['dp'][-1]) if preq_results['dp'] else 0.0
+              print(
+                  f"[Prequential] Final streamed test accuracy: {100.0 * final_acc:.2f}% | "
+                  f"Final DP: {100.0 * final_dp:.2f}%"
+              )
+              # Return prequential results as the primary timestep_results
+              timestep_results = preq_results
+          else:
+              timestep_results = None
+
+          return [], [], [], timestep_results, test_metrics, loaded_model, data_dim
+        else:
+          return [], [], [], None, None, loaded_model, data_dim
+    else:
+      print(f"Warning: Model file {model_file} not found. Proceeding with training...")
+  
+  if dataset == 'adult':
+    num_class = 2
+    x_train, x_test, y_train, y_test, a_train, a_test = data.read_adult(
+        drift, drift_scenario=drift_scenario
+    )
+    data_dim = x_train.shape[1]
+    print(f"Sensitive attribute values in training set: {set(a_train)}")
+    assert len(set(a_train)) == 2, "Expected binary sensitive attribute for adult dataset"
+  elif dataset == 'census':
+    num_class = 2
+    x_train, x_test, y_train, y_test, a_train, a_test = data.read_census()
+    data_dim = x_train.shape[1]
+  elif dataset == 'compas':
+    x_train, y_train, a_train = data.read_compas()
+    num_class = 2
+    data_dim = x_train.shape[1]
+  elif dataset == 'jigsaw':
+    x_train, y_train, a_train = data.read_jigsaw()
+    num_class = 2
+    data_dim = x_train.shape[1]
+  elif dataset == 'celeba':
+    x_train, y_train, a_train = data.read_celeba()
+    num_class = 2
+    data_dim = x_train.shape[1]
+  elif dataset == 'folktables':
+    x_train, x_test, y_train, y_test, a_train, a_test, number_of_attributes = data.read_folktables(
+        train_year=folktables_train_year,
+        test_years=folktables_test_years_tuple,
+        state=folktables_states_list,
+        horizon=folktables_horizon,
+        sensitive_attribute=folktables_sensitive_attribute,
+    )
+    data_dim = x_train.shape[1]
+    num_class = 2
+    sensitive = str(folktables_sensitive_attribute).lower()
+    print(f"Sensitive attribute values in training set: {set(a_train)}")
+    if sensitive == 'race':
+      assert len(set(a_train)) == 2, (
+          "Expected binary sensitive attribute for folktables race setup "
+          "(white vs non-white)"
+      )
+    else:
+      assert len(set(a_train)) == 2, "Expected binary sensitive attribute for folktables sex setup"
+  else:
+    x_train, y_train, a_train = [], [], []
+
+  if data_dim is None or num_class is None:
+    raise ValueError(f'Unsupported or misconfigured dataset: {dataset}')
+
+  print(f'DP in the original dataset: {utils.get_demographic_parity(y_train, a_train)[0]}')
+  print(f"EO in the original dataset: {utils.get_equalized_odds(y_train, a_train, y_train)[0]}")
+  
+  trained_model = None
+  for _ in range(max_iter):
+    model = _build_forest_model(
+      dataset=dataset,
+      data_dim=data_dim,
+      num_class=num_class,
+      depth=depth,
+      num_trees=num_trees,
+      activation=activation,
+      compute_mode=compute_mode,
+    )
+
+    dp, eo, accuracies = aranyani.train_online(
+        model,
+        x_train,
+        y_train,
+        a_train,
+        data_dim=data_dim,
+        batch_size=batch_size,
+        tree_depth=depth,
+        compute_fairness=compute_fairness,
+        lambda_const=lambda_const,
+        num_trees=num_trees,
+        base_gamma=effective_base_gamma,
+        constraint_type=constraint_type,
+        gradient_type=gradient_type,
+        local_run=local_run,
+    )
+
+    all_dps.append(dp)
+    all_accuracies.append(accuracies)
+    all_equalized_odds.append(eo)
+    trained_model = model
+
+  has_test_set = x_test is not None and len(x_test) > 0
+  test_metrics = None
+  if has_test_set and not prequential and trained_model is not None:
+    test_metrics = utils.get_test_performance(
+        trained_model, x_test, y_test, a_test,
+        data_dim=data_dim, show_confusion_matrix=True,
+    )
+    print(f"\n{'='*80}")
+    print("Test Set Results:")
+    print(f"  Test Accuracy: {test_metrics['accuracy']:.4f}")
+    print(f"  Test DP: {test_metrics['dp']:.4f}")
+    print(f"  Test AUC: {test_metrics['auc']:.4f}")
+    print(f"  Test Sensitivity: {test_metrics['sensitivity']:.4f}")
+    print(f"  Test F1-Score: {test_metrics['f1']:.4f}")
+    print(f"  Test EO: {test_metrics['eo']:.4f}")
+    print(f"{'='*80}\n")
+  elif has_test_set and prequential:
+    print("\nPrequential mode enabled with test set: skipping one-shot test metric aggregation.")
+
+
+  # Evaluate metrics over timesteps on drifted test set (single-scenario mode)
+  timestep_results = None
+  if drift and x_test is not None and len(x_test) > 0:
+    if prequential:
+      print("\nRunning prequential (test-then-train) evaluation...")
+      preq_model = copy.deepcopy(trained_model)
+      preq_results = utils.evaluate_over_timesteps(
+          preq_model, x_test, y_test, a_test, data_dim=data_dim,
+          test_then_train=True,
+          compute_fairness=compute_fairness,
+          fairness_type='dp',
+          lambda_const=lambda_const,
+          tree_depth=depth,
+          num_trees=num_trees,
+          constraint_type=constraint_type,
+          gradient_type=gradient_type,
+          base_gamma=effective_base_gamma,
+          static_params=None,
+      )
+      plot_metrics_over_timesteps(preq_results,
+                                  save_path='files/metrics_prequential.png')
+      final_acc = float(preq_results['accuracy'][-1]) if preq_results['accuracy'] else 0.0
+      final_dp = float(preq_results['dp'][-1]) if preq_results['dp'] else 0.0
+      print(
+          f"[Prequential] Final streamed test accuracy: {100.0 * final_acc:.2f}% | "
+          f"Final DP: {100.0 * final_dp:.2f}%"
+      )
+      timestep_results = preq_results
+
+  if model_path is None:
+    model_path = f'models/{dataset}_model'
+  trained_model.save(model_path)
+
+  return all_dps, all_accuracies, all_equalized_odds, timestep_results, test_metrics, trained_model, data_dim
